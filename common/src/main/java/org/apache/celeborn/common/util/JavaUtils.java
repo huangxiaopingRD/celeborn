@@ -22,6 +22,8 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Random;
@@ -132,7 +134,10 @@ public class JavaUtils {
 
   private static void deleteRecursivelyUsingJavaIO(File file, FilenameFilter filter)
       throws IOException {
-    if (file.isDirectory() && !isSymlink(file)) {
+    if (!file.exists()) return;
+    BasicFileAttributes fileAttributes =
+        Files.readAttributes(file.toPath(), BasicFileAttributes.class);
+    if (fileAttributes.isDirectory() && !isSymlink(file)) {
       IOException savedIOException = null;
       for (File child : listFilesSafely(file, filter)) {
         try {
@@ -148,7 +153,8 @@ public class JavaUtils {
     }
 
     // Delete file only when it's a normal file or an empty directory.
-    if (file.isFile() || (file.isDirectory() && listFilesSafely(file, null).length == 0)) {
+    if (fileAttributes.isRegularFile()
+        || (fileAttributes.isDirectory() && listFilesSafely(file, null).length == 0)) {
       boolean deleted = file.delete();
       // Delete can also fail if the file simply did not exist.
       if (!deleted && file.exists()) {
@@ -242,6 +248,8 @@ public class JavaUtils {
           .put("pi", ByteUnit.PiB)
           .build();
 
+  private static final Pattern TIME_STRING_PATTERN = Pattern.compile("(-?[0-9]+)([a-z]+)?");
+
   /**
    * Convert a passed time string (e.g. 50s, 100ms, or 250us) to a time count in the given unit. The
    * unit is also considered the default if the given string does not specify a unit.
@@ -250,7 +258,7 @@ public class JavaUtils {
     String lower = str.toLowerCase(Locale.ROOT).trim();
 
     try {
-      Matcher m = Pattern.compile("(-?[0-9]+)([a-z]+)?").matcher(lower);
+      Matcher m = TIME_STRING_PATTERN.matcher(lower);
       if (!m.matches()) {
         throw new NumberFormatException("Failed to parse time string: " + str);
       }
@@ -291,6 +299,10 @@ public class JavaUtils {
     return timeStringAs(str, TimeUnit.SECONDS);
   }
 
+  private static final Pattern BYTE_STRING_PATTERN = Pattern.compile("([0-9]+)([a-z]+)?");
+  private static final Pattern BYTE_STRING_FRACTION_PATTERN =
+      Pattern.compile("([0-9]+\\.[0-9]+)([a-z]+)?");
+
   /**
    * Convert a passed byte string (e.g. 50b, 100kb, or 250mb) to the given. If no suffix is
    * provided, a direct conversion to the provided unit is attempted.
@@ -299,8 +311,8 @@ public class JavaUtils {
     String lower = str.toLowerCase(Locale.ROOT).trim();
 
     try {
-      Matcher m = Pattern.compile("([0-9]+)([a-z]+)?").matcher(lower);
-      Matcher fractionMatcher = Pattern.compile("([0-9]+\\.[0-9]+)([a-z]+)?").matcher(lower);
+      Matcher m = BYTE_STRING_PATTERN.matcher(lower);
+      Matcher fractionMatcher = BYTE_STRING_FRACTION_PATTERN.matcher(lower);
 
       if (m.matches()) {
         long val = Long.parseLong(m.group(1));

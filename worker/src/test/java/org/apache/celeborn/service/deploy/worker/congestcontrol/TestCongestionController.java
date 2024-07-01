@@ -17,10 +17,6 @@
 
 package org.apache.celeborn.service.deploy.worker.congestcontrol;
 
-import java.util.Map;
-
-import scala.collection.JavaConverters;
-
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -69,7 +65,7 @@ public class TestCongestionController {
 
     Assert.assertFalse(controller.isUserCongested(userIdentifier));
 
-    controller.produceBytes(userIdentifier, 1001);
+    produceBytes(userIdentifier, 1001);
     pendingBytes = 1001;
     controller.checkCongestion();
     Assert.assertTrue(controller.isUserCongested(userIdentifier));
@@ -91,8 +87,8 @@ public class TestCongestionController {
 
     // If pendingBytes exceed the high watermark, user1 produce speed > avg consume speed
     // While user2 produce speed < avg consume speed
-    controller.produceBytes(user1, 800);
-    controller.produceBytes(user2, 201);
+    produceBytes(user1, 800);
+    produceBytes(user2, 201);
     controller.consumeBytes(500);
     pendingBytes = 1001;
     controller.checkCongestion();
@@ -100,8 +96,8 @@ public class TestCongestionController {
     Assert.assertFalse(controller.isUserCongested(user2));
 
     // If both users higher than the avg consume speed, should congest them all.
-    controller.produceBytes(user1, 800);
-    controller.produceBytes(user2, 800);
+    produceBytes(user1, 800);
+    produceBytes(user2, 800);
     controller.consumeBytes(500);
     pendingBytes = 1600;
     controller.checkCongestion();
@@ -119,44 +115,18 @@ public class TestCongestionController {
   public void testUserMetrics() throws InterruptedException {
     UserIdentifier user = new UserIdentifier("test", "celeborn");
     Assert.assertFalse(controller.isUserCongested(user));
-    controller.produceBytes(user, 800);
+    produceBytes(user, 800);
 
-    Assert.assertTrue(
-        isGaugeExist(
-            WorkerSource.USER_PRODUCE_SPEED(),
-            JavaConverters.mapAsJavaMapConverter(user.toMap()).asJava()));
+    Assert.assertTrue(source.gaugeExists(WorkerSource.USER_PRODUCE_SPEED(), user.toMap()));
 
     Thread.sleep(userInactiveTimeMills * 2);
 
-    Assert.assertFalse(
-        isGaugeExist(
-            WorkerSource.USER_PRODUCE_SPEED(),
-            JavaConverters.mapAsJavaMapConverter(user.toMap()).asJava()));
+    Assert.assertFalse(source.gaugeExists(WorkerSource.USER_PRODUCE_SPEED(), user.toMap()));
   }
 
-  private boolean isGaugeExist(String name, Map<String, String> labels) {
-    return source.namedGauges().stream()
-            .filter(
-                gauge -> {
-                  if (gauge.name().equals(name)) {
-                    return labels.entrySet().stream()
-                        .noneMatch(
-                            entry -> {
-                              // Filter entry not exist in the gauge's labels
-                              if (gauge.labels().get(entry.getKey()).nonEmpty()) {
-                                return !gauge
-                                    .labels()
-                                    .get(entry.getKey())
-                                    .get()
-                                    .equals(entry.getValue());
-                              } else {
-                                return true;
-                              }
-                            });
-                  }
-                  return false;
-                })
-            .count()
-        == 1;
+  private void produceBytes(UserIdentifier userIdentifier, long numBytes) {
+    controller
+        .getUserBuffer(userIdentifier)
+        .updateInfo(System.currentTimeMillis(), new BufferStatusHub.BufferStatusNode(numBytes));
   }
 }

@@ -20,7 +20,7 @@ package org.apache.celeborn.service.deploy.worker
 import java.io.File
 import java.lang.{Long => JLong}
 import java.util
-import java.util.{HashMap => JHashMap, HashSet => JHashSet, Locale, Map => JMap}
+import java.util.{HashMap => JHashMap, HashSet => JHashSet, Locale, Map => JMap, UUID}
 import java.util.concurrent._
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicIntegerArray}
 
@@ -170,7 +170,7 @@ private[celeborn] class Worker(
 
   val storageManager = new StorageManager(conf, workerSource)
 
-  val memoryManager: MemoryManager = MemoryManager.initialize(conf)
+  val memoryManager: MemoryManager = MemoryManager.initialize(conf, storageManager)
   memoryManager.registerMemoryListener(storageManager)
 
   val partitionsSorter = new PartitionFilesSorter(memoryManager, conf, workerSource)
@@ -325,6 +325,8 @@ private[celeborn] class Worker(
     ThreadUtils.newDaemonCachedThreadPool("worker-data-replicator", conf.workerReplicateThreads)
   val commitThreadPool: ThreadPoolExecutor =
     ThreadUtils.newDaemonCachedThreadPool("worker-files-committer", conf.workerCommitThreads)
+  val waitThreadPool: ThreadPoolExecutor =
+    ThreadUtils.newDaemonCachedThreadPool("worker-commit-waiter", conf.workerCommitFilesWaitThreads)
   val cleanThreadPool: ThreadPoolExecutor =
     ThreadUtils.newDaemonCachedThreadPool(
       "worker-expired-shuffle-cleaner",
@@ -386,11 +388,24 @@ private[celeborn] class Worker(
   workerSource.addGauge(WorkerSource.READ_BUFFER_ALLOCATED_COUNT) { () =>
     memoryManager.getAllocatedReadBuffers
   }
+  workerSource.addGauge(WorkerSource.MEMORY_FILE_STORAGE_SIZE) { () =>
+    memoryManager.getMemoryFileStorageCounter
+  }
+  workerSource.addGauge(WorkerSource.DIRECT_MEMORY_USAGE_RATIO) { () =>
+    memoryManager.workerMemoryUsageRatio()
+  }
+  workerSource.addGauge(WorkerSource.EVICTED_FILE_COUNT) { () =>
+    storageManager.evictedFileCount.get()
+  }
+  workerSource.addGauge(WorkerSource.MEMORY_STORAGE_FILE_COUNT) { () =>
+    storageManager.memoryWriters.size()
+  }
+
   workerSource.addGauge(WorkerSource.ACTIVE_SHUFFLE_SIZE) { () =>
-    storageManager.getActiveShuffleSize()
+    storageManager.getActiveShuffleSize
   }
   workerSource.addGauge(WorkerSource.ACTIVE_SHUFFLE_FILE_COUNT) { () =>
-    storageManager.getActiveShuffleFileCount()
+    storageManager.getActiveShuffleFileCount
   }
   workerSource.addGauge(WorkerSource.PAUSE_PUSH_DATA_TIME) { () =>
     memoryManager.getPausePushDataTime
@@ -406,6 +421,17 @@ private[celeborn] class Worker(
   }
   workerSource.addGauge(WorkerSource.ACTIVE_SLOTS_COUNT) { () =>
     workerInfo.usedSlots()
+  }
+  workerSource.addGauge(WorkerSource.IS_DECOMMISSIONING_WORKER) { () =>
+    if (shutdown.get() && (workerStatusManager.currentWorkerStatus.getState == State.InDecommission ||
+        workerStatusManager.currentWorkerStatus.getState == State.InDecommissionThenIdle)) {
+      1
+    } else {
+      0
+    }
+  }
+  workerSource.addGauge(WorkerSource.CLEAN_TASK_QUEUE_SIZE) { () =>
+    cleanTaskQueue.size()
   }
 
   private def highWorkload: Boolean = {
@@ -550,11 +576,13 @@ private[celeborn] class Worker(
         forwardMessageScheduler.shutdown()
         replicateThreadPool.shutdown()
         commitThreadPool.shutdown()
+        waitThreadPool.shutdown();
         asyncReplyPool.shutdown()
       } else {
         forwardMessageScheduler.shutdownNow()
         replicateThreadPool.shutdownNow()
         commitThreadPool.shutdownNow()
+        waitThreadPool.shutdownNow();
         asyncReplyPool.shutdownNow()
       }
       workerSource.appActiveConnections.clear()
@@ -683,6 +711,7 @@ private[celeborn] class Worker(
   @VisibleForTesting
   def cleanup(expiredShuffleKeys: JHashSet[String], threadPool: ThreadPoolExecutor): Unit =
     synchronized {
+      val expiredApplicationIds = new JHashSet[String]()
       expiredShuffleKeys.asScala.foreach { shuffleKey =>
         partitionLocationInfo.removeShuffle(shuffleKey)
         shufflePartitionType.remove(shuffleKey)
@@ -692,10 +721,7 @@ private[celeborn] class Worker(
         workerInfo.releaseSlots(shuffleKey)
         val applicationId = Utils.splitShuffleKey(shuffleKey)._1
         if (!workerInfo.getApplicationIdSet.contains(applicationId)) {
-          // When the running applications does not contain the application corresponding to expired shuffle key,
-          // resource consumption source should remove lose application gauges.
-          removeAppResourceConsumption(applicationId)
-          removeAppActiveConnection(applicationId)
+          expiredApplicationIds.add(applicationId)
           secretRegistry.unregister(applicationId)
         }
         logInfo(s"Cleaned up expired shuffle $shuffleKey")
@@ -703,49 +729,25 @@ private[celeborn] class Worker(
       partitionsSorter.cleanup(expiredShuffleKeys)
       fetchHandler.cleanupExpiredShuffleKey(expiredShuffleKeys)
       threadPool.execute(new Runnable {
-        override def run(): Unit = storageManager.cleanupExpiredShuffleKey(expiredShuffleKeys)
+        override def run(): Unit = {
+          removeAppActiveConnection(expiredApplicationIds)
+          workerSource.sample(
+            WorkerSource.CLEAN_EXPIRED_SHUFFLE_KEYS_TIME,
+            s"cleanExpiredShuffleKeys-${UUID.randomUUID()}") {
+            storageManager.cleanupExpiredShuffleKey(expiredShuffleKeys)
+          }
+        }
       })
     }
 
-  private def removeAppResourceConsumption(applicationId: String): Unit = {
-    removeResourceConsumptionGauge(
-      ResourceConsumptionSource.DISK_FILE_COUNT,
-      applicationId)
-    removeResourceConsumptionGauge(
-      ResourceConsumptionSource.DISK_BYTES_WRITTEN,
-      applicationId)
-    removeResourceConsumptionGauge(
-      ResourceConsumptionSource.HDFS_FILE_COUNT,
-      applicationId)
-    removeResourceConsumptionGauge(
-      ResourceConsumptionSource.HDFS_BYTES_WRITTEN,
-      applicationId)
-  }
-
-  private def removeResourceConsumptionGauge(
-      resourceConsumptionName: String,
-      applicationId: String): Unit = {
-    resourceConsumptionSource.removeGauge(
-      resourceConsumptionName,
-      resourceConsumptionSource.applicationLabel,
-      applicationId)
-  }
-
-  private def removeAppActiveConnection(applicationId: String): Unit = {
-    workerSource.removeAppActiveConnection(applicationId)
+  private def removeAppActiveConnection(applicationIds: JHashSet[String]): Unit = {
+    workerSource.removeAppActiveConnection(applicationIds)
   }
 
   override def getWorkerInfo: String = {
     val sb = new StringBuilder
     sb.append("====================== WorkerInfo of Worker ===========================\n")
     sb.append(workerInfo.toString()).append("\n")
-    sb.toString()
-  }
-
-  override def getThreadDump: String = {
-    val sb = new StringBuilder
-    sb.append("========================= Worker ThreadDump ==========================\n")
-    sb.append(Utils.getThreadDump()).append("\n")
     sb.toString()
   }
 
@@ -771,6 +773,16 @@ private[celeborn] class Worker(
     val sb = new StringBuilder
     sb.append("========================= Worker Shutdown ==========================\n")
     sb.append(shutdown.get()).append("\n")
+    sb.toString()
+  }
+
+  override def isDecommissioning: String = {
+    val sb = new StringBuilder
+    sb.append("========================= Worker Decommission ==========================\n")
+    sb.append(
+      shutdown.get() && (workerStatusManager.currentWorkerStatus.getState == State.InDecommission ||
+        workerStatusManager.currentWorkerStatus.getState == State.InDecommissionThenIdle))
+      .append("\n")
     sb.toString()
   }
 
@@ -866,10 +878,10 @@ private[celeborn] class Worker(
     workerStatusManager.transitionState(State.Exit)
   }
 
-  def sendWorkerUnavailableToMaster(): Unit = {
+  def sendWorkerDecommissionToMaster(): Unit = {
     try {
       masterClient.askSync(
-        ReportWorkerUnavailable(List(workerInfo).asJava),
+        ReportWorkerDecommission(List(workerInfo).asJava),
         OneWayMessageResponse.getClass)
     } catch {
       case e: Throwable =>
@@ -883,7 +895,7 @@ private[celeborn] class Worker(
   def decommissionWorker(): Unit = {
     logInfo("Worker start to decommission")
     workerStatusManager.transitionState(State.InDecommission)
-    sendWorkerUnavailableToMaster()
+    sendWorkerDecommissionToMaster()
     shutdown.set(true)
     val interval = conf.workerDecommissionCheckInterval
     val timeout = conf.workerDecommissionForceExitTimeout

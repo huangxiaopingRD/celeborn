@@ -111,7 +111,8 @@ public class TransportClientFactory implements Closeable {
     logger.info("mode " + ioMode + " threads " + conf.clientThreads());
     this.workerGroup =
         NettyUtils.createEventLoop(ioMode, conf.clientThreads(), conf.getModuleName() + "-client");
-    this.pooledAllocator = NettyUtils.getPooledByteBufAllocator(conf, null, false);
+    this.pooledAllocator =
+        NettyUtils.getPooledByteBufAllocator(conf, null, false, conf.clientThreads());
   }
 
   /**
@@ -154,8 +155,10 @@ public class TransportClientFactory implements Closeable {
       // this code was able to update things.
       TransportChannelHandler handler =
           cachedClient.getChannel().pipeline().get(TransportChannelHandler.class);
-      synchronized (handler) {
-        handler.getResponseHandler().updateTimeOfLastRequest();
+      if (handler != null) {
+        synchronized (handler) {
+          handler.getResponseHandler().updateTimeOfLastRequest();
+        }
       }
 
       if (cachedClient.isActive()) {

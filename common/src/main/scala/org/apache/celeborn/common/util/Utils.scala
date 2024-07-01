@@ -18,7 +18,7 @@
 package org.apache.celeborn.common.util
 
 import java.io._
-import java.lang.management.ManagementFactory
+import java.lang.management.{LockInfo, ManagementFactory, MonitorInfo, ThreadInfo}
 import java.math.{MathContext, RoundingMode}
 import java.net._
 import java.nio.ByteBuffer
@@ -415,7 +415,19 @@ object Utils extends Logging {
   }
 
   def localHostName(conf: CelebornConf): String = customHostname.getOrElse {
-    if (conf.bindPreferIP) localIpAddress.getHostAddress else localIpAddress.getCanonicalHostName
+    if (conf.bindPreferIP) {
+      localIpAddress match {
+        case ipv6Address: Inet6Address =>
+          val ip = ipv6Address.getHostAddress
+          assert(
+            !ip.startsWith("[") && !ip.endsWith("]"),
+            s"Resolved IPv6 address should not be enclosed in [] but got $ip")
+          s"[$ip]"
+        case other => other.getHostAddress
+      }
+    } else {
+      localIpAddress.getCanonicalHostName
+    }
   }
 
   /**
@@ -668,10 +680,66 @@ object Utils extends Logging {
     System.currentTimeMillis - start
   }
 
-  def getThreadDump(): String = {
-    val runtimeMXBean = ManagementFactory.getRuntimeMXBean
-    val pid = runtimeMXBean.getName.split("@")(0)
-    runCommand(s"jstack -l ${pid}")
+  /**
+   * Note: code was initially copied from Apache Spark(v3.5.1).
+   */
+  implicit private class Lock(lock: LockInfo) {
+    def lockString: String = {
+      lock match {
+        case monitor: MonitorInfo => s"Monitor(${monitor.toString})"
+        case _ => s"Lock(${lock.toString})"
+      }
+    }
+  }
+
+  /**
+   * Return a thread dump of all threads' stacktraces.
+   *
+   * <p>Note: code was initially copied from Apache Spark(v3.5.1).
+   */
+  def getThreadDump(): Seq[ThreadStackTrace] = {
+    // We need to filter out null values here because dumpAllThreads() may return null array
+    // elements for threads that are dead / don't exist.
+    ManagementFactory.getThreadMXBean.dumpAllThreads(true, true).filter(_ != null)
+      .sortWith { case (threadTrace1, threadTrace2) =>
+        val name1 = threadTrace1.getThreadName().toLowerCase(Locale.ROOT)
+        val name2 = threadTrace2.getThreadName().toLowerCase(Locale.ROOT)
+        val nameCmpRes = name1.compareTo(name2)
+        if (nameCmpRes == 0) {
+          threadTrace1.getThreadId < threadTrace2.getThreadId
+        } else {
+          nameCmpRes < 0
+        }
+      }.map(threadInfoToThreadStackTrace)
+  }
+
+  /**
+   * Note: code was initially copied from Apache Spark(v3.5.1).
+   */
+  private def threadInfoToThreadStackTrace(threadInfo: ThreadInfo): ThreadStackTrace = {
+    val monitors = threadInfo.getLockedMonitors.map(m => m.getLockedStackFrame -> m).toMap
+    val stackTrace = StackTrace(threadInfo.getStackTrace.map { frame =>
+      monitors.get(frame) match {
+        case Some(monitor) =>
+          monitor.getLockedStackFrame.toString + s" => holding ${monitor.lockString}"
+        case None =>
+          frame.toString
+      }
+    })
+
+    // use a set to dedup re-entrant locks that are held at multiple places
+    val heldLocks =
+      (threadInfo.getLockedSynchronizers ++ threadInfo.getLockedMonitors).map(_.lockString).toSet
+
+    ThreadStackTrace(
+      threadId = threadInfo.getThreadId,
+      threadName = threadInfo.getThreadName,
+      threadState = threadInfo.getThreadState,
+      stackTrace = stackTrace,
+      blockedByThreadId =
+        if (threadInfo.getLockOwnerId < 0) None else Some(threadInfo.getLockOwnerId),
+      blockedByLock = Option(threadInfo.getLockInfo).map(_.lockString).getOrElse(""),
+      holdingLocks = heldLocks.toSeq)
   }
 
   private def readProcessStdout(process: Process): String = {

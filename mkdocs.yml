@@ -71,6 +71,7 @@ nav:
       - Security: security.md
       - Quota Management: quota_management.md
       - Upgrading: upgrading.md
+      - Decommissioning: decommissioning.md
       - Ratis Shell: celeborn_ratis_shell.md
       - Cluster Planning: cluster_planning.md
   - Configuration: configuration/index.md
@@ -95,3 +96,4 @@ nav:
       - Integrating Celeborn: developers/integrate.md
       - SBT Build: developers/sbt.md
       - Gluten Support: developers/glutensupport.md
+      - Helm Charts: developers/helm-charts.md

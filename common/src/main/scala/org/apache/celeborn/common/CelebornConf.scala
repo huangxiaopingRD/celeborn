@@ -26,7 +26,7 @@ import scala.collection.mutable
 import scala.concurrent.duration._
 import scala.util.Try
 
-import org.apache.celeborn.common.CelebornConf.MASTER_INTERNAL_ENDPOINTS
+import org.apache.celeborn.common.authentication.AnonymousAuthenticationProviderImpl
 import org.apache.celeborn.common.identity.{DefaultIdentityProvider, IdentityProvider}
 import org.apache.celeborn.common.internal.Logging
 import org.apache.celeborn.common.internal.config._
@@ -636,7 +636,7 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
   def masterSlotAssignPolicy: SlotsAssignPolicy =
     SlotsAssignPolicy.valueOf(get(MASTER_SLOT_ASSIGN_POLICY))
   def availableStorageTypes: Int = {
-    val types = get(ACTIVE_STORAGE_TYPES).split(",").map(StorageInfo.Type.valueOf(_)).toList
+    val types = get(ACTIVE_STORAGE_TYPES).split(",").map(StorageInfo.Type.valueOf).toList
     StorageInfo.getAvailableTypes(types.asJava)
   }
   def hasHDFSStorage: Boolean =
@@ -743,8 +743,10 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
 
   def haMasterRatisRpcType: String = get(HA_MASTER_RATIS_RPC_TYPE)
   def haMasterRatisStorageDir: String = get(HA_MASTER_RATIS_STORAGE_DIR)
+  def haMasterRatisStorageStartupOption: String = get(HA_MASTER_RATIS_STORAGE_STARTUP_OPTION)
   def haMasterRatisLogSegmentSizeMax: Long = get(HA_MASTER_RATIS_LOG_SEGMENT_SIZE_MAX)
   def haMasterRatisLogPreallocatedSize: Long = get(HA_MASTER_RATIS_LOG_PREALLOCATED_SIZE)
+  def haMasterRatisLogWriteBufferSize: Long = get(HA_MASTER_RATIS_LOG_WRITE_BUFFER_SIZE)
   def haMasterRatisLogAppenderQueueNumElements: Int =
     get(HA_MASTER_RATIS_LOG_APPENDER_QUEUE_NUM_ELEMENTS)
   def haMasterRatisLogAppenderQueueBytesLimit: Long =
@@ -803,6 +805,7 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
   def workerReplicateThreads: Int = get(WORKER_REPLICATE_THREADS)
   def workerCommitThreads: Int =
     if (hasHDFSStorage) Math.max(128, get(WORKER_COMMIT_THREADS)) else get(WORKER_COMMIT_THREADS)
+  def workerCommitFilesWaitThreads: Int = get(WORKER_COMMIT_FILES_WAIT_THREADS)
   def workerCleanThreads: Int = get(WORKER_CLEAN_THREADS)
   def workerShuffleCommitTimeout: Long = get(WORKER_SHUFFLE_COMMIT_TIMEOUT)
   def maxPartitionSizeToEstimate: Long =
@@ -811,6 +814,8 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
   def workerPartitionSorterSortPartitionTimeout: Long = get(WORKER_PARTITION_SORTER_SORT_TIMEOUT)
   def workerPartitionSorterPrefetchEnabled: Boolean =
     get(WORKER_PARTITION_SORTER_PREFETCH_ENABLED)
+  def workerPartitionSorterShuffleBlockCompactionFactor: Double =
+    get(WORKER_SHUFFLE_BLOCK_COMPACTION_FACTOR)
   def workerPartitionSorterReservedMemoryPerPartition: Long =
     get(WORKER_PARTITION_SORTER_RESERVED_MEMORY_PER_PARTITION)
   def workerPartitionSorterThreads: Int =
@@ -1012,8 +1017,7 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
     }
   }
 
-  def shuffleForceFallbackPartitionThreshold: Long =
-    get(SPARK_SHUFFLE_FORCE_FALLBACK_PARTITION_THRESHOLD)
+  def shuffleFallbackPartitionThreshold: Long = get(SPARK_SHUFFLE_FALLBACK_PARTITION_THRESHOLD)
   def shuffleExpiredCheckIntervalMs: Long = get(SHUFFLE_EXPIRED_CHECK_INTERVAL)
   def shuffleManagerPort: Int = get(CLIENT_SHUFFLE_MANAGER_PORT)
   def shuffleChunkSize: Long = get(SHUFFLE_CHUNK_SIZE)
@@ -1022,8 +1026,6 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
     PartitionSplitMode.valueOf(get(SHUFFLE_PARTITION_SPLIT_MODE))
   def shufflePartitionSplitThreshold: Long = get(SHUFFLE_PARTITION_SPLIT_THRESHOLD)
   def batchHandleChangePartitionEnabled: Boolean = get(CLIENT_BATCH_HANDLE_CHANGE_PARTITION_ENABLED)
-  def batchHandleChangePartitionBuckets: Int =
-    get(CLIENT_BATCH_HANDLE_CHANGE_PARTITION_BUCKETS)
   def batchHandleChangePartitionNumThreads: Int = get(CLIENT_BATCH_HANDLE_CHANGE_PARTITION_THREADS)
   def batchHandleChangePartitionRequestInterval: Long =
     get(CLIENT_BATCH_HANDLE_CHANGE_PARTITION_INTERVAL)
@@ -1201,8 +1203,10 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
     get(WORKER_DIRECT_MEMORY_TRIM_CHANNEL_WAIT_INTERVAL)
   def workerDirectMemoryTrimFlushWaitInterval: Long =
     get(WORKER_DIRECT_MEMORY_TRIM_FLUSH_WAIT_INTERVAL)
-  def workerDirectMemoryRatioForShuffleStorage: Double =
-    get(WORKER_DIRECT_MEMORY_RATIO_FOR_SHUFFLE_STORAGE)
+  def workerDirectMemoryRatioForMemoryFilesStorage: Double =
+    get(WORKER_DIRECT_MEMORY_RATIO_FOR_MEMORY_FILE_STORAGE)
+  def workerMemoryFileStorageMaxFileSize: Long =
+    get(WORKER_MEMORY_FILE_STORAGE_MAX_FILE_SIZE)
 
   // //////////////////////////////////////////////////////
   //                  Rate Limit controller              //
@@ -2189,6 +2193,71 @@ object CelebornConf extends Logging {
       .timeConf(TimeUnit.MILLISECONDS)
       .createWithDefaultString("30s")
 
+  val MASTER_HTTP_AUTH_SUPPORTED_SCHEMES: ConfigEntry[Seq[String]] =
+    buildConf("celeborn.master.http.auth.supportedSchemes")
+      .categories("master")
+      .version("0.6.0")
+      .doc("A comma-separated list of master http auth supported schemes." +
+        "<ul>" +
+        " <li>SPNEGO: Kerberos/GSSAPI authentication.</li>" +
+        " <li>BASIC: User-defined password authentication, the concreted implementation is" +
+        " configurable via `celeborn.master.http.auth.basic.provider`.</li>" +
+        " <li>BEARER: User-defined bearer token authentication, the concreted implementation is" +
+        " configurable via `celeborn.master.http.auth.bearer.provider`.</li>" +
+        "</ul>")
+      .stringConf
+      .toSequence
+      .createWithDefault(Nil)
+
+  val MASTER_HTTP_SPNEGO_KEYTAB: OptionalConfigEntry[String] =
+    buildConf("celeborn.master.http.spnego.keytab")
+      .categories("master")
+      .version("0.6.0")
+      .doc("The keytab file for SPNego authentication.")
+      .stringConf
+      .createOptional
+
+  val MASTER_HTTP_SPNEGO_PRINCIPAL: OptionalConfigEntry[String] =
+    buildConf("celeborn.master.http.spnego.principal")
+      .categories("master")
+      .version("0.6.0")
+      .doc("SPNego service principal, typical value would look like HTTP/_HOST@EXAMPLE.COM." +
+        " SPNego service principal would be used when celeborn http authentication is enabled." +
+        " This needs to be set only if SPNEGO is to be used in authentication.")
+      .stringConf
+      .createOptional
+
+  val MASTER_HTTP_PROXY_CLIENT_IP_HEADER: ConfigEntry[String] =
+    buildConf("celeborn.master.http.proxy.client.ip.header")
+      .categories("master")
+      .doc("The HTTP header to record the real client IP address. If your server is behind a load" +
+        " balancer or other proxy, the server will see this load balancer or proxy IP address as" +
+        " the client IP address, to get around this common issue, most load balancers or proxies" +
+        " offer the ability to record the real remote IP address in an HTTP header that will be" +
+        " added to the request for other devices to use. Note that, because the header value can" +
+        " be specified to any IP address, so it will not be used for authentication.")
+      .version("0.6.0")
+      .stringConf
+      .createWithDefault("X-Real-IP")
+
+  val MASTER_HTTP_AUTH_BASIC_PROVIDER: ConfigEntry[String] =
+    buildConf("celeborn.master.http.auth.basic.provider")
+      .categories("master")
+      .version("0.6.0")
+      .doc("User-defined password authentication implementation of " +
+        "org.apache.celeborn.common.authentication.PasswdAuthenticationProvider")
+      .stringConf
+      .createWithDefault(classOf[AnonymousAuthenticationProviderImpl].getName)
+
+  val MASTER_HTTP_AUTH_BEARER_PROVIDER: ConfigEntry[String] =
+    buildConf("celeborn.master.http.auth.bearer.provider")
+      .categories("master")
+      .version("0.6.0")
+      .doc("User-defined token authentication implementation of " +
+        "org.apache.celeborn.common.authentication.TokenAuthenticationProvider")
+      .stringConf
+      .createWithDefault(classOf[AnonymousAuthenticationProviderImpl].getName)
+
   val HA_ENABLED: ConfigEntry[Boolean] =
     buildConf("celeborn.master.ha.enabled")
       .withAlternative("celeborn.ha.enabled")
@@ -2262,9 +2331,19 @@ object CelebornConf extends Logging {
     buildConf("celeborn.master.ha.ratis.raft.server.storage.dir")
       .withAlternative("celeborn.ha.master.ratis.raft.server.storage.dir")
       .categories("ha")
+      .doc("Root storage directory to hold RaftServer data.")
       .version("0.3.0")
       .stringConf
       .createWithDefault("/tmp/ratis")
+
+  val HA_MASTER_RATIS_STORAGE_STARTUP_OPTION: ConfigEntry[String] =
+    buildConf("celeborn.master.ha.ratis.raft.server.storage.startup.option")
+      .categories("ha")
+      .doc("Startup option of RaftServer storage. Available options: RECOVER, FORMAT.")
+      .version("0.5.0")
+      .stringConf
+      .checkValues(Set("RECOVER", "FORMAT"))
+      .createWithDefault("RECOVER")
 
   val HA_MASTER_RATIS_LOG_SEGMENT_SIZE_MAX: ConfigEntry[Long] =
     buildConf("celeborn.master.ha.ratis.raft.server.log.segment.size.max")
@@ -2283,6 +2362,14 @@ object CelebornConf extends Logging {
       .version("0.3.0")
       .bytesConf(ByteUnit.BYTE)
       .createWithDefaultString("4MB")
+
+  val HA_MASTER_RATIS_LOG_WRITE_BUFFER_SIZE: ConfigEntry[Long] =
+    buildConf("celeborn.master.ha.ratis.raft.server.log.write.buffer.size")
+      .internal
+      .categories("ha")
+      .version("0.5.0")
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefaultString("36MB")
 
   val HA_MASTER_RATIS_LOG_APPENDER_QUEUE_NUM_ELEMENTS: ConfigEntry[Int] =
     buildConf("celeborn.master.ha.ratis.raft.server.log.appender.buffer.element-limit")
@@ -2584,6 +2671,7 @@ object CelebornConf extends Logging {
       .doc("Max chunk size of reducer's merged shuffle data. For example, if a reducer's " +
         "shuffle data is 128M and the data will need 16 fetch chunk requests to fetch.")
       .bytesConf(ByteUnit.BYTE)
+      .checkValue(v => v < Integer.MAX_VALUE, "Chunk size can not be larger than 2GB")
       .createWithDefaultString("8m")
 
   val CLIENT_FETCH_DFS_READ_CHUNK_SIZE: ConfigEntry[Long] =
@@ -2772,6 +2860,71 @@ object CelebornConf extends Logging {
       .timeConf(TimeUnit.MILLISECONDS)
       .createWithDefaultString("30s")
 
+  val WORKER_HTTP_AUTH_SUPPORTED_SCHEMES: ConfigEntry[Seq[String]] =
+    buildConf("celeborn.worker.http.auth.supportedSchemes")
+      .categories("worker")
+      .version("0.6.0")
+      .doc("A comma-separated list of worker http auth supported schemes." +
+        "<ul>" +
+        " <li>SPNEGO: Kerberos/GSSAPI authentication.</li>" +
+        " <li>BASIC: User-defined password authentication, the concreted implementation is" +
+        " configurable via `celeborn.worker.http.auth.basic.provider`.</li>" +
+        " <li>BEARER: User-defined bearer token authentication, the concreted implementation is" +
+        " configurable via `celeborn.worker.http.auth.bearer.provider`.</li>" +
+        "</ul>")
+      .stringConf
+      .toSequence
+      .createWithDefault(Nil)
+
+  val WORKER_HTTP_SPNEGO_KEYTAB: OptionalConfigEntry[String] =
+    buildConf("celeborn.worker.http.spnego.keytab")
+      .categories("worker")
+      .version("0.6.0")
+      .doc("The keytab file for SPNego authentication.")
+      .stringConf
+      .createOptional
+
+  val WORKER_HTTP_SPNEGO_PRINCIPAL: OptionalConfigEntry[String] =
+    buildConf("celeborn.worker.http.spnego.principal")
+      .categories("worker")
+      .version("0.6.0")
+      .doc("SPNego service principal, typical value would look like HTTP/_HOST@EXAMPLE.COM." +
+        " SPNego service principal would be used when celeborn http authentication is enabled." +
+        " This needs to be set only if SPNEGO is to be used in authentication.")
+      .stringConf
+      .createOptional
+
+  val WORKER_HTTP_PROXY_CLIENT_IP_HEADER: ConfigEntry[String] =
+    buildConf("celeborn.worker.http.proxy.client.ip.header")
+      .categories("worker")
+      .doc("The HTTP header to record the real client IP address. If your server is behind a load" +
+        " balancer or other proxy, the server will see this load balancer or proxy IP address as" +
+        " the client IP address, to get around this common issue, most load balancers or proxies" +
+        " offer the ability to record the real remote IP address in an HTTP header that will be" +
+        " added to the request for other devices to use. Note that, because the header value can" +
+        " be specified to any IP address, so it will not be used for authentication.")
+      .version("0.6.0")
+      .stringConf
+      .createWithDefault("X-Real-IP")
+
+  val WORKER_HTTP_AUTH_BASIC_PROVIDER: ConfigEntry[String] =
+    buildConf("celeborn.worker.http.auth.basic.provider")
+      .categories("worker")
+      .version("0.6.0")
+      .doc("User-defined password authentication implementation of " +
+        "org.apache.celeborn.common.authentication.PasswdAuthenticationProvider")
+      .stringConf
+      .createWithDefault(classOf[AnonymousAuthenticationProviderImpl].getName)
+
+  val WORKER_HTTP_AUTH_BEARER_PROVIDER: ConfigEntry[String] =
+    buildConf("celeborn.worker.http.auth.bearer.provider")
+      .categories("worker")
+      .version("0.6.0")
+      .doc("User-defined token authentication implementation of " +
+        "org.apache.celeborn.common.authentication.TokenAuthenticationProvider")
+      .stringConf
+      .createWithDefault(classOf[AnonymousAuthenticationProviderImpl].getName)
+
   val WORKER_RPC_PORT: ConfigEntry[Int] =
     buildConf("celeborn.worker.rpc.port")
       .categories("worker")
@@ -2885,6 +3038,14 @@ object CelebornConf extends Logging {
       .intConf
       .createWithDefault(32)
 
+  val WORKER_COMMIT_FILES_WAIT_THREADS: ConfigEntry[Int] =
+    buildConf("celeborn.worker.commitFiles.wait.threads")
+      .categories("worker")
+      .version("0.5.0")
+      .doc("Thread number of worker to wait for commit shuffle data files to finish.")
+      .intConf
+      .createWithDefault(32)
+
   val WORKER_CLEAN_THREADS: ConfigEntry[Int] =
     buildConf("celeborn.worker.clean.threads")
       .categories("worker")
@@ -2958,6 +3119,16 @@ object CelebornConf extends Logging {
       .version("0.5.0")
       .booleanConf
       .createWithDefault(true)
+
+  val WORKER_SHUFFLE_BLOCK_COMPACTION_FACTOR: ConfigEntry[Double] =
+    buildConf("celeborn.shuffle.sortPartition.block.compactionFactor")
+      .categories("worker")
+      .version("0.4.2")
+      .doc("Combine sorted shuffle blocks such that size of compacted shuffle block does not " +
+        s"exceed compactionFactor * ${SHUFFLE_CHUNK_SIZE.key}")
+      .doubleConf
+      .checkValue(v => v >= 0.0 && v <= 1.0, "Should be in [0.0, 1.0].")
+      .createWithDefault(0.25)
 
   val WORKER_FLUSHER_BUFFER_SIZE: ConfigEntry[Long] =
     buildConf("celeborn.worker.flusher.buffer.size")
@@ -3193,13 +3364,14 @@ object CelebornConf extends Logging {
       .doubleConf
       .createWithDefault(0.1)
 
-  val WORKER_DIRECT_MEMORY_RATIO_FOR_SHUFFLE_STORAGE: ConfigEntry[Double] =
-    buildConf("celeborn.worker.directMemoryRatioForMemoryShuffleStorage")
+  val WORKER_DIRECT_MEMORY_RATIO_FOR_MEMORY_FILE_STORAGE: ConfigEntry[Double] =
+    buildConf("celeborn.worker.directMemoryRatioForMemoryFileStorage")
       .categories("worker")
-      .doc("Max ratio of direct memory to store shuffle data")
-      .version("0.2.0")
+      .doc("Max ratio of direct memory to store shuffle data. " +
+        "This feature is experimental and disabled by default.")
+      .version("0.5.0")
       .doubleConf
-      .createWithDefault(0.0)
+      .createWithDefault(0)
 
   val WORKER_DIRECT_MEMORY_RATIO_PAUSE_RECEIVE: ConfigEntry[Double] =
     buildConf("celeborn.worker.directMemoryRatioToPauseReceive")
@@ -3225,6 +3397,15 @@ object CelebornConf extends Logging {
       .version("0.2.0")
       .doubleConf
       .createWithDefault(0.7)
+
+  val WORKER_MEMORY_FILE_STORAGE_MAX_FILE_SIZE: ConfigEntry[Long] =
+    buildConf("celeborn.worker.memoryFileStorage.maxFileSize")
+      .categories("worker")
+      .doc("Max size for a memory storage file. It must be less than 2GB.")
+      .version("0.5.0")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(v => v < Int.MaxValue, "A single memory storage file can not be larger than 2GB")
+      .createWithDefaultString("8MB")
 
   val WORKER_CONGESTION_CONTROL_ENABLED: ConfigEntry[Boolean] =
     buildConf("celeborn.worker.congestionControl.enabled")
@@ -4062,14 +4243,6 @@ object CelebornConf extends Logging {
       .booleanConf
       .createWithDefault(true)
 
-  val CLIENT_BATCH_HANDLE_CHANGE_PARTITION_BUCKETS: ConfigEntry[Int] =
-    buildConf("celeborn.client.shuffle.batchHandleChangePartition.partitionBuckets")
-      .categories("client")
-      .doc("Max number of change partition requests which can be concurrently processed ")
-      .version("0.5.0")
-      .intConf
-      .createWithDefault(256)
-
   val CLIENT_BATCH_HANDLE_CHANGE_PARTITION_THREADS: ConfigEntry[Int] =
     buildConf("celeborn.client.shuffle.batchHandleChangePartition.threads")
       .withAlternative("celeborn.shuffle.batchHandleChangePartition.threads")
@@ -4379,10 +4552,13 @@ object CelebornConf extends Logging {
     buildConf("celeborn.client.spark.shuffle.fallback.policy")
       .categories("client")
       .version("0.5.0")
-      .doc(
-        s"Celeborn supports the following kind of fallback policies. 1. ${FallbackPolicy.ALWAYS.name}: force fallback shuffle to Spark's default; " +
-          s"2. ${FallbackPolicy.AUTO.name}: consider other factors like availability of enough workers and quota, or whether shuffle of partition number is lower than celeborn.client.spark.shuffle.forceFallback.numPartitionsThreshold; " +
-          s"3. ${FallbackPolicy.NEVER.name}: the job will fail if it is concluded that fallback is required based on factors above.")
+      .doc("Celeborn supports the following kind of fallback policies. " +
+        s"1. ${FallbackPolicy.ALWAYS.name}: always use spark built-in shuffle implementation; " +
+        s"2. ${FallbackPolicy.AUTO.name}: prefer to use celeborn shuffle implementation, and fallback to use spark " +
+        "built-in shuffle implementation based on certain factors, e.g. availability of enough workers and quota, " +
+        "shuffle partition number; " +
+        s"3. ${FallbackPolicy.NEVER.name}: always use celeborn shuffle implementation, and fail fast when it it is " +
+        "concluded that fallback is required based on factors above.")
       .stringConf
       .transform(_.toUpperCase(Locale.ROOT))
       .checkValues(Set(
@@ -4396,17 +4572,20 @@ object CelebornConf extends Logging {
       .withAlternative("celeborn.shuffle.forceFallback.enabled")
       .categories("client")
       .version("0.3.0")
-      .doc(s"Whether force fallback shuffle to Spark's default. This configuration only takes effect when ${CelebornConf.SPARK_SHUFFLE_FALLBACK_POLICY.key} is ${FallbackPolicy.AUTO.name}.")
+      .doc("Always use spark built-in shuffle implementation. This configuration is deprecated, " +
+        s"consider configuring `${CelebornConf.SPARK_SHUFFLE_FALLBACK_POLICY.key}` instead.")
       .booleanConf
       .createWithDefault(false)
 
-  val SPARK_SHUFFLE_FORCE_FALLBACK_PARTITION_THRESHOLD: ConfigEntry[Long] =
-    buildConf("celeborn.client.spark.shuffle.forceFallback.numPartitionsThreshold")
+  val SPARK_SHUFFLE_FALLBACK_PARTITION_THRESHOLD: ConfigEntry[Long] =
+    buildConf("celeborn.client.spark.shuffle.fallback.numPartitionsThreshold")
       .withAlternative("celeborn.shuffle.forceFallback.numPartitionsThreshold")
+      .withAlternative("celeborn.client.spark.shuffle.forceFallback.numPartitionsThreshold")
       .categories("client")
-      .version("0.3.0")
-      .doc(
-        s"Celeborn will only accept shuffle of partition number lower than this configuration value. This configuration only takes effect when ${CelebornConf.SPARK_SHUFFLE_FALLBACK_POLICY.key} is ${FallbackPolicy.AUTO.name}.")
+      .version("0.5.0")
+      .doc("Celeborn will only accept shuffle of partition number lower than this configuration value. " +
+        s"This configuration only takes effect when `${CelebornConf.SPARK_SHUFFLE_FALLBACK_POLICY.key}` " +
+        s"is `${FallbackPolicy.AUTO.name}`.")
       .longConf
       .createWithDefault(Int.MaxValue)
 
@@ -4788,7 +4967,7 @@ object CelebornConf extends Logging {
         "Enabled storages. Available options: MEMORY,HDD,SSD,HDFS. Note: HDD and SSD would be treated as identical.")
       .stringConf
       .transform(_.toUpperCase(Locale.ROOT))
-      .checkValue(p => p.split(",").map(StorageInfo.validate(_)).reduce(_ && _), "")
+      .checkValue(p => p.split(",").map(StorageInfo.validate).reduce(_ && _), "")
       .createWithDefault("HDD")
 
   val READ_LOCAL_SHUFFLE_FILE: ConfigEntry[Boolean] =

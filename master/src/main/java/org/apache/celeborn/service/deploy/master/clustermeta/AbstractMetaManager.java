@@ -22,7 +22,6 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.file.Files;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -66,7 +65,8 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
   // Metadata for master service
   public final Set<String> registeredShuffle = ConcurrentHashMap.newKeySet();
   public final Set<String> hostnameSet = ConcurrentHashMap.newKeySet();
-  public final ArrayList<WorkerInfo> workers = new ArrayList<>();
+  public final Set<WorkerInfo> workers = ConcurrentHashMap.newKeySet();
+
   public final ConcurrentHashMap<WorkerInfo, Long> lostWorkers = JavaUtils.newConcurrentHashMap();
   public final ConcurrentHashMap<WorkerInfo, WorkerEventInfo> workerEventInfos =
       JavaUtils.newConcurrentHashMap();
@@ -74,6 +74,7 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
   public final Set<WorkerInfo> excludedWorkers = ConcurrentHashMap.newKeySet();
   public final Set<WorkerInfo> manuallyExcludedWorkers = ConcurrentHashMap.newKeySet();
   public final Set<WorkerInfo> shutdownWorkers = ConcurrentHashMap.newKeySet();
+  public final Set<WorkerInfo> decommissionWorkers = ConcurrentHashMap.newKeySet();
   public final Set<WorkerInfo> workerLostEvents = ConcurrentHashMap.newKeySet();
 
   protected RpcEnv rpcEnv;
@@ -162,6 +163,7 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
           lostWorkers.remove(workerInfo);
           shutdownWorkers.remove(workerInfo);
           workerEventInfos.remove(workerInfo);
+          decommissionWorkers.remove(workerInfo);
         }
       }
     }
@@ -256,6 +258,7 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
       lostWorkers.remove(workerInfo);
       excludedWorkers.remove(workerInfo);
       workerEventInfos.remove(workerInfo);
+      decommissionWorkers.remove(workerInfo);
     }
   }
 
@@ -283,7 +286,8 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
                 lostWorkers,
                 shutdownWorkers,
                 workerEventInfos,
-                applicationMetas)
+                applicationMetas,
+                decommissionWorkers)
             .toByteArray();
     Files.write(file.toPath(), snapshotBytes);
   }
@@ -366,6 +370,11 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
               .map(PbSerDeUtils::fromPbWorkerInfo)
               .collect(Collectors.toSet()));
 
+      decommissionWorkers.addAll(
+          snapshotMetaInfo.getDecommissionWorkersList().stream()
+              .map(PbSerDeUtils::fromPbWorkerInfo)
+              .collect(Collectors.toSet()));
+
       partitionTotalWritten.add(snapshotMetaInfo.getPartitionTotalWritten());
       partitionTotalFileCount.add(snapshotMetaInfo.getPartitionTotalFileCount());
       appDiskUsageMetric.restoreFromSnapshot(
@@ -403,6 +412,7 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
     appHeartbeatTime.clear();
     excludedWorkers.clear();
     shutdownWorkers.clear();
+    decommissionWorkers.clear();
     manuallyExcludedWorkers.clear();
     workerLostEvents.clear();
     partitionTotalWritten.reset();
@@ -433,6 +443,12 @@ public abstract class AbstractMetaManager implements IMetadataHandler {
           }
         }
       }
+    }
+  }
+
+  public void updateMetaByReportWorkerDecommission(List<WorkerInfo> workers) {
+    synchronized (this.workers) {
+      decommissionWorkers.addAll(workers);
     }
   }
 

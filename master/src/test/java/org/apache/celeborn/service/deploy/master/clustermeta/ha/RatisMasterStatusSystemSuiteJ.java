@@ -65,8 +65,12 @@ public class RatisMasterStatusSystemSuiteJ {
   protected static RpcEndpointRef mockRpcEndpoint = Mockito.mock(RpcEndpointRef.class);
 
   @BeforeClass
-  public static void init() throws IOException, InterruptedException {
-    resetRaftServer();
+  public static void init() throws Exception {
+    resetRaftServer(
+        configureServerConf(new CelebornConf(), 1),
+        configureServerConf(new CelebornConf(), 2),
+        configureServerConf(new CelebornConf(), 3),
+        false);
   }
 
   private static void stopAllRaftServers() {
@@ -81,7 +85,17 @@ public class RatisMasterStatusSystemSuiteJ {
     }
   }
 
-  public static void resetRaftServer() throws IOException, InterruptedException {
+  static CelebornConf configureServerConf(CelebornConf conf, int id) throws IOException {
+    File tmpDir = File.createTempFile("celeborn-ratis" + id, "for-test-only");
+    tmpDir.delete();
+    tmpDir.mkdirs();
+    conf.set(CelebornConf.HA_MASTER_RATIS_STORAGE_DIR().key(), tmpDir.getAbsolutePath());
+    return conf;
+  }
+
+  public static void resetRaftServer(
+      CelebornConf conf1, CelebornConf conf2, CelebornConf conf3, boolean sslEnabled)
+      throws IOException, InterruptedException {
     Mockito.when(mockRpcEnv.setupEndpointRef(Mockito.any(), Mockito.any()))
         .thenReturn(mockRpcEndpoint);
     when(mockRpcEnv.setupEndpointRef(any(), any())).thenReturn(dummyRef);
@@ -101,24 +115,6 @@ public class RatisMasterStatusSystemSuiteJ {
         MetaHandler handler2 = new MetaHandler(STATUSSYSTEM2);
         MetaHandler handler3 = new MetaHandler(STATUSSYSTEM3);
 
-        CelebornConf conf1 = new CelebornConf();
-        File tmpDir1 = File.createTempFile("celeborn-ratis1", "for-test-only");
-        tmpDir1.delete();
-        tmpDir1.mkdirs();
-        conf1.set(CelebornConf.HA_MASTER_RATIS_STORAGE_DIR().key(), tmpDir1.getAbsolutePath());
-
-        CelebornConf conf2 = new CelebornConf();
-        File tmpDir2 = File.createTempFile("celeborn-ratis2", "for-test-only");
-        tmpDir2.delete();
-        tmpDir2.mkdirs();
-        conf2.set(CelebornConf.HA_MASTER_RATIS_STORAGE_DIR().key(), tmpDir2.getAbsolutePath());
-
-        CelebornConf conf3 = new CelebornConf();
-        File tmpDir3 = File.createTempFile("celeborn-ratis3", "for-test-only");
-        tmpDir3.delete();
-        tmpDir3.mkdirs();
-        conf3.set(CelebornConf.HA_MASTER_RATIS_STORAGE_DIR().key(), tmpDir3.getAbsolutePath());
-
         String id1 = UUID.randomUUID().toString();
         String id2 = UUID.randomUUID().toString();
         String id3 = UUID.randomUUID().toString();
@@ -133,6 +129,7 @@ public class RatisMasterStatusSystemSuiteJ {
                 .setRatisPort(ratisPort1)
                 .setRpcPort(ratisPort1)
                 .setInternalRpcPort(ratisPort1)
+                .setSslEnabled(sslEnabled)
                 .setNodeId(id1)
                 .build();
         MasterNode masterNode2 =
@@ -141,6 +138,7 @@ public class RatisMasterStatusSystemSuiteJ {
                 .setRatisPort(ratisPort2)
                 .setRpcPort(ratisPort2)
                 .setInternalRpcPort(ratisPort2)
+                .setSslEnabled(sslEnabled)
                 .setNodeId(id2)
                 .build();
         MasterNode masterNode3 =
@@ -149,6 +147,7 @@ public class RatisMasterStatusSystemSuiteJ {
                 .setRatisPort(ratisPort3)
                 .setRpcPort(ratisPort3)
                 .setInternalRpcPort(ratisPort3)
+                .setSslEnabled(sslEnabled)
                 .setNodeId(id3)
                 .build();
 
@@ -304,7 +303,7 @@ public class RatisMasterStatusSystemSuiteJ {
     } catch (CelebornRuntimeException e) {
       Assert.assertTrue(true);
     } finally {
-      resetRaftServer();
+      init();
     }
   }
 
@@ -1278,5 +1277,66 @@ public class RatisMasterStatusSystemSuiteJ {
         break;
       }
     }
+  }
+
+  @Test
+  public void testHandleReportWorkerDecommission() throws InterruptedException {
+    AbstractMetaManager statusSystem = pickLeaderStatusSystem();
+    Assert.assertNotNull(statusSystem);
+
+    statusSystem.handleRegisterWorker(
+        HOSTNAME1,
+        RPCPORT1,
+        PUSHPORT1,
+        FETCHPORT1,
+        REPLICATEPORT1,
+        INTERNALPORT1,
+        NETWORK_LOCATION1,
+        disks1,
+        userResourceConsumption1,
+        getNewReqeustId());
+    statusSystem.handleRegisterWorker(
+        HOSTNAME2,
+        RPCPORT2,
+        PUSHPORT2,
+        FETCHPORT2,
+        REPLICATEPORT2,
+        INTERNALPORT2,
+        NETWORK_LOCATION2,
+        disks2,
+        userResourceConsumption2,
+        getNewReqeustId());
+    statusSystem.handleRegisterWorker(
+        HOSTNAME3,
+        RPCPORT3,
+        PUSHPORT3,
+        FETCHPORT3,
+        REPLICATEPORT3,
+        INTERNALPORT3,
+        NETWORK_LOCATION3,
+        disks3,
+        userResourceConsumption3,
+        getNewReqeustId());
+
+    List<WorkerInfo> workers = new ArrayList<>();
+    workers.add(
+        new WorkerInfo(
+            HOSTNAME1,
+            RPCPORT1,
+            PUSHPORT1,
+            FETCHPORT1,
+            REPLICATEPORT1,
+            INTERNALPORT1,
+            disks1,
+            userResourceConsumption1));
+
+    statusSystem.handleReportWorkerDecommission(workers, getNewReqeustId());
+    Thread.sleep(3000L);
+    Assert.assertEquals(1, STATUSSYSTEM1.decommissionWorkers.size());
+    Assert.assertEquals(1, STATUSSYSTEM2.decommissionWorkers.size());
+    Assert.assertEquals(1, STATUSSYSTEM3.decommissionWorkers.size());
+    Assert.assertEquals(0, STATUSSYSTEM1.excludedWorkers.size());
+    Assert.assertEquals(0, STATUSSYSTEM2.excludedWorkers.size());
+    Assert.assertEquals(0, STATUSSYSTEM3.excludedWorkers.size());
   }
 }

@@ -43,7 +43,7 @@ object Dependencies {
   val commonsCryptoVersion = "1.0.0"
   val commonsIoVersion = "2.13.0"
   val commonsLoggingVersion = "1.1.3"
-  val commonsLang3Version = "3.12.0"
+  val commonsLang3Version = "3.13.0"
   val findbugsVersion = "1.3.9"
   val guavaVersion = "33.1.0-jre"
   val hadoopVersion = "3.3.6"
@@ -53,10 +53,10 @@ object Dependencies {
   val leveldbJniVersion = "1.8"
   val log4j2Version = "2.17.2"
   val jdkToolsVersion = "0.1"
-  val metricsVersion = "3.2.6"
+  val metricsVersion = "4.2.25"
   val mockitoVersion = "4.11.0"
   val nettyVersion = "4.1.109.Final"
-  val ratisVersion = "2.5.1"
+  val ratisVersion = "3.0.1"
   val roaringBitmapVersion = "1.0.6"
   val rocksdbJniVersion = "8.11.3"
   val jacksonVersion = "2.15.3"
@@ -107,11 +107,20 @@ object Dependencies {
     ExclusionRule("log4j", "log4j"),
     ExclusionRule("org.slf4j", "slf4j-log4j12"))
   val ioDropwizardMetricsCore = "io.dropwizard.metrics" % "metrics-core" % metricsVersion
-  val ioDropwizardMetricsGraphite = "io.dropwizard.metrics" % "metrics-graphite" % metricsVersion
+  val ioDropwizardMetricsGraphite = "io.dropwizard.metrics" % "metrics-graphite" % metricsVersion excludeAll (
+    ExclusionRule("com.rabbitmq", "amqp-client"))
   val ioDropwizardMetricsJvm = "io.dropwizard.metrics" % "metrics-jvm" % metricsVersion
   val ioNetty = "io.netty" % "netty-all" % nettyVersion excludeAll(
     ExclusionRule("io.netty", "netty-handler-ssl-ocsp"))
-  val leveldbJniAll = "org.openlabtesting.leveldbjni" % "leveldbjni-all" % leveldbJniVersion
+  val leveldbJniGroup = if (System.getProperty("os.name").startsWith("Linux")
+    && System.getProperty("os.arch").equals("aarch64")) {
+    // use org.openlabtesting.leveldbjni on aarch64 platform except MacOS
+    // org.openlabtesting.leveldbjni requires glibc version 3.4.21
+    "org.openlabtesting.leveldbjni"
+  } else {
+    "org.fusesource.leveldbjni"
+  }
+  val leveldbJniAll = leveldbJniGroup % "leveldbjni-all" % leveldbJniVersion
   val log4j12Api = "org.apache.logging.log4j" % "log4j-1.2-api" % log4j2Version
   val log4jSlf4jImpl = "org.apache.logging.log4j" % "log4j-slf4j-impl" % log4j2Version
   val lz4Java = "org.lz4" % "lz4-java" % lz4JavaVersion
@@ -119,6 +128,7 @@ object Dependencies {
   val ratisClient = "org.apache.ratis" % "ratis-client" % ratisVersion
   val ratisCommon = "org.apache.ratis" % "ratis-common" % ratisVersion
   val ratisGrpc = "org.apache.ratis" % "ratis-grpc" % ratisVersion
+  val ratisMetricsDefault = "org.apache.ratis" % "ratis-metrics-default" % ratisVersion
   val ratisNetty = "org.apache.ratis" % "ratis-netty" % ratisVersion
   val ratisServer = "org.apache.ratis" % "ratis-server" % ratisVersion
   val ratisShell = "org.apache.ratis" % "ratis-shell" % ratisVersion excludeAll(
@@ -429,8 +439,6 @@ object CelebornCommon {
         Dependencies.hadoopClientApi,
         Dependencies.hadoopClientRuntime,
         Dependencies.jdkTools,
-        Dependencies.ratisClient,
-        Dependencies.ratisCommon,
         Dependencies.leveldbJniAll,
         Dependencies.roaringBitmap,
         Dependencies.scalaReflect,
@@ -528,6 +536,7 @@ object CelebornService {
 object CelebornMaster {
   lazy val master = Project("celeborn-master", file("master"))
     .dependsOn(CelebornCommon.common)
+    .dependsOn(CelebornCommon.common % "test->test;compile->compile")
     .dependsOn(CelebornService.service % "test->test;compile->compile")
     .settings (
       commonSettings,
@@ -542,6 +551,7 @@ object CelebornMaster {
         Dependencies.ratisClient,
         Dependencies.ratisCommon,
         Dependencies.ratisGrpc,
+        Dependencies.ratisMetricsDefault,
         Dependencies.ratisNetty,
         Dependencies.ratisServer,
         Dependencies.ratisShell
@@ -558,11 +568,6 @@ object CelebornWorker {
     .dependsOn(CelebornMaster.master % "test->compile")
     .settings (
       commonSettings,
-      excludeDependencies ++= Seq(
-        // ratis-common/ratis-client are the transitive dependencies from celeborn-common
-        ExclusionRule("org.apache.ratis", "ratis-common"),
-        ExclusionRule("org.apache.ratis", "ratis-client")
-      ),
       libraryDependencies ++= Seq(
         Dependencies.apLoader,
         Dependencies.guava,
