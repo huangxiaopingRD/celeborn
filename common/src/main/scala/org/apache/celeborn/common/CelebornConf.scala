@@ -894,6 +894,7 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
   def metricsWorkerForceAppendPauseSpentTimeThreshold: Int =
     get(METRICS_WORKER_PAUSE_SPENT_TIME_FORCE_APPEND_THRESHOLD)
   def metricsJsonPrettyEnabled: Boolean = get(METRICS_JSON_PRETTY_ENABLED)
+  def metricsWorkerAppLevelEnabled: Boolean = get(METRICS_WORKER_APP_LEVEL_ENABLED)
 
   // //////////////////////////////////////////////////////
   //                      Quota                         //
@@ -1181,10 +1182,6 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
 
   def partitionSplitMinimumSize: Long = get(WORKER_PARTITION_SPLIT_MIN_SIZE)
   def partitionSplitMaximumSize: Long = get(WORKER_PARTITION_SPLIT_MAX_SIZE)
-
-  def s3AccessKey: String = get(S3_ACCESS_KEY).getOrElse("")
-
-  def s3SecretKey: String = get(S3_SECRET_KEY).getOrElse("")
 
   def s3EndpointRegion: String = get(S3_ENDPOINT_REGION).getOrElse("")
 
@@ -3162,22 +3159,6 @@ object CelebornConf extends Logging {
       .categories("worker", "master", "client")
       .version("0.6.0")
       .doc("S3 base directory for Celeborn to store shuffle data.")
-      .stringConf
-      .createOptional
-
-  val S3_SECRET_KEY: OptionalConfigEntry[String] =
-    buildConf("celeborn.storage.s3.secret.key")
-      .categories("worker", "master", "client")
-      .version("0.6.0")
-      .doc("S3 secret key for Celeborn to store shuffle data.")
-      .stringConf
-      .createOptional
-
-  val S3_ACCESS_KEY: OptionalConfigEntry[String] =
-    buildConf("celeborn.storage.s3.access.key")
-      .categories("worker", "master", "client")
-      .version("0.6.0")
-      .doc("S3 access key for Celeborn to store shuffle data.")
       .stringConf
       .createOptional
 
@@ -5540,10 +5521,12 @@ object CelebornConf extends Logging {
       .categories("metrics")
       .doc("Size for top items about top resource consumption applications list of worker. " +
         "The top resource consumption is determined by sum of diskBytesWritten and hdfsBytesWritten. " +
-        "The top resource consumption count prevents the total number of metrics from exceeding the metrics capacity.")
+        "The top resource consumption count prevents the total number of metrics from exceeding the metrics capacity. " +
+        "Note: This will add applicationId as label which is considered as a high cardinality label, " +
+        "be careful enabling it on metrics systems that are not optimized for high cardinality columns.")
       .version("0.6.0")
       .intConf
-      .createWithDefault(50)
+      .createWithDefault(0)
 
   val METRICS_WORKER_APP_TOP_RESOURCE_CONSUMPTION_BYTES_WRITTEN_THRESHOLD: ConfigEntry[Long] =
     buildConf("celeborn.metrics.worker.app.topResourceConsumption.bytesWrittenThreshold")
@@ -5586,6 +5569,16 @@ object CelebornConf extends Logging {
       .categories("metrics")
       .doc("When true, view metrics in json pretty format")
       .version("0.4.0")
+      .booleanConf
+      .createWithDefault(true)
+
+  val METRICS_WORKER_APP_LEVEL_ENABLED: ConfigEntry[Boolean] =
+    buildConf("celeborn.metrics.worker.appLevel.enabled")
+      .categories("metrics")
+      .doc("When true, enable worker application level metrics. Note: applicationId is " +
+        "considered as a high cardinality label, be careful enabling it on metrics systems " +
+        "that are not optimized for high cardinality columns.")
+      .version("0.6.0")
       .booleanConf
       .createWithDefault(true)
 
